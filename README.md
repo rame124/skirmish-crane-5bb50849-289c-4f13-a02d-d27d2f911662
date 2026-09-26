@@ -42,3 +42,11 @@ Test the connection with:
 ```console
 python -m sandbox llm
 ```
+
+## AI-use discolosure and reflection
+
+I used ChatGPT to update my Skirmish at Crane's Reach agent so that the agents now utilize a finite state machine and have improved logic for combat. ChatGPT made the code changes; and I did not make additional manual edits. I reviewed the new agent, checked the helpers against the environment page, and tested it against the seeds before and after each change. The new agent now performs as wanted for the design goal.
+
+# Design Goal
+
+My design goal for this agent was: In the skirmish game, players will see the units group together before seeking out enemies and better terrain for fighting.
