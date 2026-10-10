@@ -49,4 +49,4 @@ I used ChatGPT to update my Skirmish at Crane's Reach agent so that the agents n
 
 # Design Goal
 
-My design goal for this agent was: In the skirmish game, players will see the units group together before seeking out enemies and better terrain for fighting.
+My design goal for this agent was: In the skirmish game, players will see the units group together to tackle challenges as an army instead of as an individual.
