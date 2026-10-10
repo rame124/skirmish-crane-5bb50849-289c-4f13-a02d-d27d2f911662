@@ -1,7 +1,10 @@
 {
   "env_id": "skirmish_crane",
-  "season": "Season 2: The March",
+  "season": "Season 3: The Army",
   "parameters": {
-    "terrain": true
+    "seat_plan": "army",
+    "field_extent": 12,
+    "terrain": true,
+    "unit_abilities": true
   }
 }

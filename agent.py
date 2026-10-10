@@ -11,32 +11,61 @@ from sandbox.observation_types import (
 class State(Enum):
     ASSEMBLE = auto()
     ADVANCE = auto()
-    SCOUT = auto()
-    REGROUP = auto()
     ENGAGE = auto()
+    REGROUP = auto()
 
 
 class Agent:
     """
-    Season 2 terrain-aware finite state machine.
+    Season 3 squad-based Crane Reach agent.
+
+    Army organization:
+      Squad 0: footman_0, archer_0, cavalry_0
+      Squad 1: footman_1, archer_1, cavalry_1
+      ...
+      Squad 5: footman_5, archer_5, cavalry_5
+
+      Reserve: footman_6 + footman_7
 
     Strategy:
-    - Footman and archer assemble on advantageous terrain.
-    - Archer seeks hills/forest when protected by allies.
-    - Footman pushes enemies while the archer follows.
-    - Cavalry scouts after the group assembles.
-    - Cavalry regroups when unsupported.
-    - Cavalry regroups at half health instead of fighting alone.
-    - Once together, all units attack using the same target rule.
+    - Each squad gets its own rally lane.
+    - Squads try to assemble before advancing.
+    - Squad members slow down to stay together.
+    - If enemies appear while allies are nearby, everyone attacks.
+    - If a unit encounters enemies alone, it regroups.
+    - Archers seek hills when protected by squadmates.
+    - Cavalry prefers charge attacks when fighting with its squad.
+    - Half-health cavalry regroups, but may rejoin combat once
+      friendly support is present.
+    - Movement can detour around rivers and other obstacles instead
+      of freezing when no legal path directly reduces distance.
     """
 
     def reset(self, seed, observation) -> None:
         self.state = State.ASSEMBLE
 
+        # Used to discourage immediate backtracking while navigating
+        # around rivers and other obstacles.
+        self.previous_position = None
+        self.avoid_position = None
+
+    # ============================================================
+    # MAIN DECISION
+    # ============================================================
+
     def act(
         self,
         observation: SkirmishObservation,
     ) -> SkirmishAction:
+
+        current_position = me.position(observation)
+
+        # Remember where this unit was on its previous activation.
+        self.avoid_position = self.previous_position
+        self.previous_position = {
+            "q": current_position["q"],
+            "r": current_position["r"],
+        }
 
         self._update_state(observation)
 
@@ -62,11 +91,16 @@ class Agent:
         observation: SkirmishObservation,
     ) -> None:
 
-        unit_type = me.unit_type(observation)
         enemies = visible.enemies(observation)
+        unit_type = me.unit_type(observation)
+
+        nearby_mates = self._nearby_squadmates(
+            observation,
+            distance=4,
+        )
 
         # --------------------------------------------------------
-        # CAVALRY STATE MACHINE
+        # CAVALRY DAMAGE RESPONSE
         # --------------------------------------------------------
 
         if unit_type == "cavalry":
@@ -74,142 +108,75 @@ class Agent:
             hp = me.hit_points(observation)
             max_hp = units.STATS["cavalry"].hit_points
 
-            allies = visible.allies(observation)
-
-            grouped = self._has_nearby_ally(
-                observation,
-                distance=3,
-            )
-
-            # Half health means return to the team.
             if hp <= max_hp / 2:
 
-                if grouped and enemies:
+                # A wounded cavalry unit does not abandon a fight
+                # when the squad is already with it.
+                if enemies and nearby_mates:
                     self.state = State.ENGAGE
                 else:
                     self.state = State.REGROUP
 
                 return
 
-            # Enemy contact.
-            if enemies:
+        # --------------------------------------------------------
+        # ENEMY CONTACT
+        # --------------------------------------------------------
 
-                target = self._choose_target(
-                    observation,
-                    enemies,
-                )
+        if enemies:
 
-                supported = any(
-                    self._ally_can_support(
-                        ally,
-                        target,
-                    )
-                    for ally in allies
-                )
+            # We have squad support: fight together.
+            if nearby_mates:
+                self.state = State.ENGAGE
 
-                if supported or grouped:
-                    self.state = State.ENGAGE
-                else:
-                    self.state = State.REGROUP
-
-                return
-
-            # No enemies visible.
-
-            if self.state == State.ENGAGE:
-                self.state = State.SCOUT
-                return
-
-            if self.state == State.REGROUP:
-
-                if grouped:
-                    self.state = State.ADVANCE
-
-                return
-
-            if self.state == State.ASSEMBLE:
-
-                footman = self._find_ally_type(
-                    observation,
-                    "footman",
-                )
-
-                archer = self._find_ally_type(
-                    observation,
-                    "archer",
-                )
-
-                if (
-                    footman is not None
-                    and archer is not None
-                    and tile.distance(
-                        footman["position"],
-                        archer["position"],
-                    ) <= 3
-                ):
-                    self.state = State.SCOUT
-
-                return
+            # We encountered the enemy alone.
+            else:
+                self.state = State.REGROUP
 
             return
 
         # --------------------------------------------------------
-        # ARCHER / FOOTMAN STATE MACHINE
+        # ASSEMBLY
         # --------------------------------------------------------
-
-        partner_type = (
-            "footman"
-            if unit_type == "archer"
-            else "archer"
-        )
-
-        partner = self._find_ally_type(
-            observation,
-            partner_type,
-        )
 
         if self.state == State.ASSEMBLE:
 
-            # Do not abandon assembly merely because an enemy
-            # becomes visible.
-            if partner is None:
-                return
-
-            distance = tile.distance(
-                me.position(observation),
-                partner["position"],
-            )
-
-            if (
-                distance <= 3
-                and self._at_rally_area(observation)
-            ):
-                if enemies:
-                    self.state = State.ENGAGE
-                else:
-                    self.state = State.ADVANCE
-
-            return
-
-        if self.state == State.ADVANCE:
-
-            if partner is None:
-                self.state = State.ASSEMBLE
-
-            elif enemies:
-                self.state = State.ENGAGE
-
-            return
-
-        if self.state == State.ENGAGE:
-
-            if partner is None:
-                self.state = State.ASSEMBLE
-
-            elif not enemies:
+            if self._squad_ready(observation):
                 self.state = State.ADVANCE
 
             return
+
+        # --------------------------------------------------------
+        # AFTER COMBAT
+        # --------------------------------------------------------
+
+        if self.state == State.ENGAGE:
+
+            self.state = State.ADVANCE
+            return
+
+        # --------------------------------------------------------
+        # REGROUPING
+        # --------------------------------------------------------
+
+        if self.state == State.REGROUP:
+
+            # Once we have at least one squadmate nearby,
+            # resume moving with the group.
+            if nearby_mates:
+                self.state = State.ADVANCE
+
+            return
+
+        # --------------------------------------------------------
+        # ADVANCING
+        # --------------------------------------------------------
+
+        if self.state == State.ADVANCE:
+
+            # If we completely lose our squad, regroup.
+            if not self._visible_squadmates(observation):
+                self.state = State.REGROUP
 
     # ============================================================
     # ARCHER
@@ -221,65 +188,29 @@ class Agent:
     ) -> SkirmishAction:
 
         enemies = visible.enemies(observation)
-        here = me.position(observation)
-
-        footman = self._find_ally_type(
-            observation,
-            "footman",
-        )
 
         # --------------------------------------------------------
-        # EMERGENCY: ENEMY CAVALRY TOO CLOSE
+        # ASSEMBLE / REGROUP
         # --------------------------------------------------------
 
-        danger = self._dangerous_cavalry(
-            observation,
-        )
+        if self.state in (
+            State.ASSEMBLE,
+            State.REGROUP,
+        ):
 
-        if danger is not None and footman is not None:
-
-            path = self._path_toward(
-                observation,
-                footman["position"],
-                max_steps=2,
-            )
-
-            if path != 0:
-                return action.move(
-                    path,
-                    danger["unit_id"],
-                    observation,
-                )
-
-            return action.stay(
-                danger["unit_id"],
+            goal = self._formation_goal(
                 observation,
             )
-
-        # --------------------------------------------------------
-        # ASSEMBLE
-        # --------------------------------------------------------
-
-        if self.state == State.ASSEMBLE:
-
-            if footman is not None:
-                goal = footman["position"]
-            else:
-                goal = self._rally_point(
-                    observation,
-                )
 
             path = self._path_toward_archer_terrain(
                 observation,
                 goal,
-                footman,
             )
 
             if path != 0:
 
                 if enemies:
                     target = self._choose_target(
-                        observation,
                         enemies,
                     )
 
@@ -294,7 +225,6 @@ class Agent:
             if enemies:
 
                 target = self._choose_target(
-                    observation,
                     enemies,
                 )
 
@@ -312,37 +242,16 @@ class Agent:
         if self.state == State.ENGAGE and enemies:
 
             target = self._choose_target(
-                observation,
                 enemies,
             )
 
-            # First priority: do not lose the footman entirely.
-            if footman is not None:
+            # If protected, try to obtain high ground before
+            # simply standing still and firing.
+            if self._archer_is_protected(
+                observation
+            ):
 
-                distance_to_footman = tile.distance(
-                    here,
-                    footman["position"],
-                )
-
-                if distance_to_footman > 4:
-
-                    path = self._path_toward(
-                        observation,
-                        footman["position"],
-                        max_steps=2,
-                    )
-
-                    if path != 0:
-                        return action.move(
-                            path,
-                            target["unit_id"],
-                            observation,
-                        )
-
-            # If we are protected, actively seek better terrain.
-            if self._archer_is_protected(observation):
-
-                path = self._best_protected_archer_position(
+                path = self._best_archer_attack_position(
                     observation,
                     target["position"],
                 )
@@ -354,7 +263,6 @@ class Agent:
                         observation,
                     )
 
-            # Otherwise hold position and shoot.
             return action.stay(
                 target["unit_id"],
                 observation,
@@ -364,29 +272,13 @@ class Agent:
         # ADVANCE
         # --------------------------------------------------------
 
-        if footman is not None:
-
-            distance_to_footman = tile.distance(
-                here,
-                footman["position"],
-            )
-
-            if distance_to_footman > 4:
-                goal = footman["position"]
-            else:
-                goal = tile.at_center(
-                    observation,
-                )
-
-        else:
-            goal = self._rally_point(
-                observation,
-            )
+        goal = self._advance_goal(
+            observation,
+        )
 
         path = self._path_toward_archer_terrain(
             observation,
             goal,
-            footman,
         )
 
         if path != 0:
@@ -405,23 +297,18 @@ class Agent:
 
         enemies = visible.enemies(observation)
 
-        archer = self._find_ally_type(
-            observation,
-            "archer",
-        )
-
         # --------------------------------------------------------
-        # ASSEMBLE
+        # ASSEMBLE / REGROUP
         # --------------------------------------------------------
 
-        if self.state == State.ASSEMBLE:
+        if self.state in (
+            State.ASSEMBLE,
+            State.REGROUP,
+        ):
 
-            if archer is not None:
-                goal = archer["position"]
-            else:
-                goal = self._rally_point(
-                    observation,
-                )
+            goal = self._formation_goal(
+                observation,
+            )
 
             path = self._path_toward(
                 observation,
@@ -434,7 +321,6 @@ class Agent:
                 if enemies:
 
                     target = self._choose_target(
-                        observation,
                         enemies,
                     )
 
@@ -449,7 +335,6 @@ class Agent:
             if enemies:
 
                 target = self._choose_target(
-                    observation,
                     enemies,
                 )
 
@@ -467,7 +352,6 @@ class Agent:
         if self.state == State.ENGAGE and enemies:
 
             target = self._choose_target(
-                observation,
                 enemies,
             )
 
@@ -493,14 +377,9 @@ class Agent:
         # ADVANCE
         # --------------------------------------------------------
 
-        if archer is None:
-            goal = self._rally_point(
-                observation,
-            )
-        else:
-            goal = tile.at_center(
-                observation,
-            )
+        goal = self._advance_goal(
+            observation,
+        )
 
         path = self._path_toward(
             observation,
@@ -525,17 +404,66 @@ class Agent:
         enemies = visible.enemies(observation)
 
         # --------------------------------------------------------
+        # ASSEMBLE / REGROUP
+        # --------------------------------------------------------
+
+        if self.state in (
+            State.ASSEMBLE,
+            State.REGROUP,
+        ):
+
+            goal = self._formation_goal(
+                observation,
+            )
+
+            # Full speed is okay while trying to catch the squad.
+            path = self._path_toward(
+                observation,
+                goal,
+            )
+
+            if path != 0:
+
+                if enemies:
+
+                    target = self._choose_target(
+                        enemies,
+                    )
+
+                    return action.move(
+                        path,
+                        target["unit_id"],
+                        observation,
+                    )
+
+                return action.move(path)
+
+            if enemies:
+
+                target = self._choose_target(
+                    enemies,
+                )
+
+                return action.stay(
+                    target["unit_id"],
+                    observation,
+                )
+
+            return action.stay()
+
+        # --------------------------------------------------------
         # ENGAGE
+        #
+        # Cavalry attempts to get a Charge attack when possible.
         # --------------------------------------------------------
 
         if self.state == State.ENGAGE and enemies:
 
             target = self._choose_target(
-                observation,
                 enemies,
             )
 
-            path = self._path_toward(
+            path = self._cavalry_attack_path(
                 observation,
                 target["position"],
             )
@@ -553,136 +481,20 @@ class Agent:
             )
 
         # --------------------------------------------------------
-        # REGROUP
+        # ADVANCE
+        #
+        # Once cavalry is with the squad, limit it to two steps.
+        # This prevents it from outrunning the footman/archer.
         # --------------------------------------------------------
 
-        if self.state == State.REGROUP:
-
-            allies = visible.allies(
-                observation
-            )
-
-            if allies:
-
-                here = me.position(observation)
-
-                nearest_ally = min(
-                    allies,
-                    key=lambda ally: tile.distance(
-                        here,
-                        ally["position"],
-                    ),
-                )
-
-                goal = nearest_ally["position"]
-
-            else:
-
-                goal = self._rally_point(
-                    observation,
-                )
-
-            path = self._path_toward(
-                observation,
-                goal,
-            )
-
-            if enemies:
-
-                target = self._choose_target(
-                    observation,
-                    enemies,
-                )
-
-                if path != 0:
-                    return action.move(
-                        path,
-                        target["unit_id"],
-                        observation,
-                    )
-
-                return action.stay(
-                    target["unit_id"],
-                    observation,
-                )
-
-            if path != 0:
-                return action.move(path)
-
-            return action.stay()
-
-        # --------------------------------------------------------
-        # ASSEMBLE
-        # --------------------------------------------------------
-
-        if self.state == State.ASSEMBLE:
-
-            rally = self._rally_point(
-                observation,
-            )
-
-            path = self._path_toward(
-                observation,
-                rally,
-            )
-
-            if path != 0:
-                return action.move(path)
-
-            return action.stay()
-
-        # --------------------------------------------------------
-        # ADVANCE WITH GROUP
-        # --------------------------------------------------------
-
-        if self.state == State.ADVANCE:
-
-            allies = visible.allies(
-                observation
-            )
-
-            if allies:
-
-                here = me.position(observation)
-
-                nearest_ally = min(
-                    allies,
-                    key=lambda ally: tile.distance(
-                        here,
-                        ally["position"],
-                    ),
-                )
-
-                distance_to_ally = tile.distance(
-                    here,
-                    nearest_ally["position"],
-                )
-
-                if distance_to_ally <= 3:
-                    return action.stay()
-
-                path = self._path_toward(
-                    observation,
-                    nearest_ally["position"],
-                    max_steps=2,
-                )
-
-                if path != 0:
-                    return action.move(path)
-
-            return action.stay()
-
-        # --------------------------------------------------------
-        # SCOUT
-        # --------------------------------------------------------
-
-        center = tile.at_center(
+        goal = self._advance_goal(
             observation,
         )
 
         path = self._path_toward(
             observation,
-            center,
+            goal,
+            max_steps=2,
         )
 
         if path != 0:
@@ -691,281 +503,422 @@ class Agent:
         return action.stay()
 
     # ============================================================
+    # SQUAD IDENTITY
+    # ============================================================
+
+    def _unit_index(
+        self,
+        observation: SkirmishObservation,
+    ) -> int:
+
+        unit_id = me.unit_id(observation)
+
+        try:
+            return int(
+                unit_id.rsplit("_", 1)[1]
+            )
+        except (ValueError, IndexError):
+            return 0
+
+    def _squad_number(
+        self,
+        observation: SkirmishObservation,
+    ) -> int:
+        """
+        Squads 0-5 are F/A/C teams.
+
+        Footmen 6 and 7 form reserve squad 6.
+        """
+
+        index = self._unit_index(
+            observation
+        )
+
+        unit_type = me.unit_type(
+            observation
+        )
+
+        if (
+            unit_type == "footman"
+            and index >= 6
+        ):
+            return 6
+
+        return min(index, 5)
+
+    def _squad_member_ids(
+        self,
+        observation: SkirmishObservation,
+    ) -> set[str]:
+
+        side = me.side(observation)
+
+        squad = self._squad_number(
+            observation
+        )
+
+        # Reserve footmen.
+        if squad == 6:
+
+            return {
+                f"{side}_footman_6",
+                f"{side}_footman_7",
+            }
+
+        # Normal 3-unit squad.
+        return {
+            f"{side}_footman_{squad}",
+            f"{side}_archer_{squad}",
+            f"{side}_cavalry_{squad}",
+        }
+
+    def _visible_squadmates(
+        self,
+        observation: SkirmishObservation,
+    ) -> list[dict]:
+
+        squad_ids = self._squad_member_ids(
+            observation
+        )
+
+        own_id = me.unit_id(
+            observation
+        )
+
+        return [
+            ally
+            for ally in visible.allies(observation)
+            if (
+                ally["unit_id"] in squad_ids
+                and ally["unit_id"] != own_id
+            )
+        ]
+
+    def _nearby_squadmates(
+        self,
+        observation: SkirmishObservation,
+        distance: int = 4,
+    ) -> list[dict]:
+
+        here = me.position(observation)
+
+        return [
+            ally
+            for ally in self._visible_squadmates(
+                observation
+            )
+            if tile.distance(
+                here,
+                ally["position"],
+            ) <= distance
+        ]
+
+    def _squad_ready(
+        self,
+        observation: SkirmishObservation,
+    ) -> bool:
+
+        squad = self._squad_number(
+            observation
+        )
+
+        nearby = self._nearby_squadmates(
+            observation,
+            distance=4,
+        )
+
+        # Reserve pair needs its one partner.
+        if squad == 6:
+            return len(nearby) >= 1
+
+        # Normal squad needs both other members.
+        if len(nearby) >= 2:
+            return True
+
+        # Don't wait forever if terrain/pathing separates one member.
+        current_round = self._round_number(
+            observation
+        )
+
+        if (
+            current_round >= 10
+            and len(nearby) >= 1
+        ):
+            return True
+
+        return False
+
+    # ============================================================
+    # FORMATION / MOVEMENT GOALS
+    # ============================================================
+
+    def _formation_goal(
+        self,
+        observation: SkirmishObservation,
+    ) -> AxialPosition:
+        """
+        During assembly/regrouping:
+        - Follow a visible squadmate if separated.
+        - Otherwise return to the squad's rally area.
+        """
+
+        mates = self._visible_squadmates(
+            observation
+        )
+
+        if mates:
+
+            here = me.position(
+                observation
+            )
+
+            nearest = min(
+                mates,
+                key=lambda ally: tile.distance(
+                    here,
+                    ally["position"],
+                ),
+            )
+
+            return nearest["position"]
+
+        return self._squad_rally_point(
+            observation
+        )
+
+    def _advance_goal(
+        self,
+        observation: SkirmishObservation,
+    ) -> AxialPosition:
+        """
+        If a squadmate is falling behind, maintain cohesion.
+        Otherwise advance down the squad's lane.
+        """
+
+        here = me.position(
+            observation
+        )
+
+        mates = self._visible_squadmates(
+            observation
+        )
+
+        if mates:
+
+            nearest = min(
+                mates,
+                key=lambda ally: tile.distance(
+                    here,
+                    ally["position"],
+                ),
+            )
+
+            nearest_distance = tile.distance(
+                here,
+                nearest["position"],
+            )
+
+            if nearest_distance > 4:
+                return nearest["position"]
+
+        rally = self._squad_rally_point(
+            observation
+        )
+
+        # Mirror the rally point into enemy territory.
+        # This naturally creates a lane for each squad.
+        return tile.at_mirror(
+            rally,
+            observation,
+        )
+
+    # ============================================================
+    # SQUAD RALLY POINT
+    # ============================================================
+
+    def _squad_rally_point(
+        self,
+        observation: SkirmishObservation,
+    ) -> AxialPosition:
+
+        center = tile.at_center(
+            observation
+        )
+
+        forward = me.direction(
+            observation
+        )
+
+        opposite = {
+            1: 4,
+            2: 5,
+            3: 6,
+            4: 1,
+            5: 2,
+            6: 3,
+        }
+
+        own_direction = opposite[
+            forward
+        ]
+
+        # Adjust automatically to the season's map size.
+        extent = self._field_extent(
+            observation
+        )
+
+        rally_depth = max(
+            4,
+            extent // 2,
+        )
+
+        anchor = center
+
+        for _ in range(rally_depth):
+
+            anchor = tile.neighbors(
+                anchor
+            )[own_direction]
+
+        squad = self._squad_number(
+            observation
+        )
+
+        # Six squads spread across six lanes.
+        lane_offsets = {
+            0: -3,
+            1: -2,
+            2: -1,
+            3: 1,
+            4: 2,
+            5: 3,
+            6: 0,
+        }
+
+        offset = lane_offsets.get(
+            squad,
+            0,
+        )
+
+        # Mirror lateral orientation between Red and Blue.
+        if forward == 2:
+            negative_direction = 6
+            positive_direction = 3
+        else:
+            negative_direction = 3
+            positive_direction = 6
+
+        lateral_direction = (
+            positive_direction
+            if offset > 0
+            else negative_direction
+        )
+
+        for _ in range(abs(offset)):
+
+            anchor = tile.neighbors(
+                anchor
+            )[lateral_direction]
+
+        # Each squad looks only around its own local anchor.
+        # That prevents the entire army from chasing one hill.
+        candidates = self._positions_within(
+            anchor,
+            radius=1,
+        )
+
+        best_position = anchor
+        best_score = -10000
+
+        for position in candidates:
+
+            score = self._terrain_score(
+                observation,
+                position,
+            )
+
+            if score <= -100:
+                continue
+
+            weighted_score = (
+                score * 10
+                - tile.distance(
+                    anchor,
+                    position,
+                )
+            )
+
+            if weighted_score > best_score:
+
+                best_score = weighted_score
+                best_position = position
+
+        return best_position
+
+    # ============================================================
     # TARGET SELECTION
     # ============================================================
 
     def _choose_target(
         self,
-        observation: SkirmishObservation,
         enemies: list[dict],
     ) -> dict:
+        """
+        Shared deterministic rule.
 
-        here = me.position(observation)
+        Lowest HP first, then unit ID.
+
+        Removing distance as a tie-breaker makes squad members
+        more likely to select the exact same enemy.
+        """
 
         return min(
             enemies,
             key=lambda enemy: (
                 enemy["hit_points"],
-                tile.distance(
-                    here,
-                    enemy["position"],
-                ),
                 enemy["unit_id"],
             ),
         )
 
     # ============================================================
-    # CAVALRY THREAT TO ARCHER
-    # ============================================================
-
-    def _dangerous_cavalry(
-        self,
-        observation: SkirmishObservation,
-    ):
-
-        here = me.position(observation)
-
-        cavalry = [
-            enemy
-            for enemy in visible.enemies(observation)
-            if enemy["type"] == "cavalry"
-        ]
-
-        if not cavalry:
-            return None
-
-        nearest = min(
-            cavalry,
-            key=lambda enemy: tile.distance(
-                here,
-                enemy["position"],
-            ),
-        )
-
-        if tile.distance(
-            here,
-            nearest["position"],
-        ) <= 3:
-            return nearest
-
-        return None
-
-    # ============================================================
-    # GROUP HELPERS
-    # ============================================================
-
-    def _find_ally_type(
-        self,
-        observation: SkirmishObservation,
-        wanted_type: str,
-    ):
-
-        for ally in visible.allies(
-            observation
-        ):
-
-            if ally["type"] == wanted_type:
-                return ally
-
-        return None
-
-    def _has_nearby_ally(
-        self,
-        observation: SkirmishObservation,
-        distance: int = 3,
-    ) -> bool:
-
-        here = me.position(observation)
-
-        for ally in visible.allies(
-            observation
-        ):
-
-            if tile.distance(
-                here,
-                ally["position"],
-            ) <= distance:
-                return True
-
-        return False
-
-    def _ally_can_support(
-        self,
-        ally: dict,
-        target: dict,
-    ) -> bool:
-
-        stats = units.STATS[
-            ally["type"]
-        ]
-
-        distance = tile.distance(
-            ally["position"],
-            target["position"],
-        )
-
-        reach = (
-            stats.movement_points
-            + stats.attack_range
-        )
-
-        return distance <= reach
-
-    # ============================================================
-    # ARCHER PROTECTION
+    # ARCHER SUPPORT / HIGH GROUND
     # ============================================================
 
     def _archer_is_protected(
         self,
         observation: SkirmishObservation,
     ) -> bool:
-        """
-        Archer is considered protected when another friendly
-        unit is within 4 hexes.
-        """
 
-        here = me.position(observation)
-
-        for ally in visible.allies(
-            observation
-        ):
-
-            if tile.distance(
-                here,
-                ally["position"],
-            ) <= 4:
-                return True
-
-        return False
-
-    # ============================================================
-    # TERRAIN SCORE
-    # ============================================================
-
-    def _terrain_score(
-        self,
-        observation: SkirmishObservation,
-        position: AxialPosition,
-    ) -> int:
-
-        terrain_info = tile.terrain_at(
-            observation,
-            position,
-        )
-
-        terrain_type = terrain_info["terrain"]
-        feature = terrain_info["feature"]
-
-        if terrain_type in (
-            "water",
-            "void",
-        ):
-            return -100
-
-        score = 0
-
-        if terrain_type == "hill":
-            score += 5
-
-        if feature == "forest":
-            score += 3
-
-        if feature == "marsh":
-            score -= 4
-
-        return score
-
-    # ============================================================
-    # ARCHER FIRING POSITION SCORE
-    # ============================================================
-
-    def _archer_position_score(
-        self,
-        observation: SkirmishObservation,
-        position: AxialPosition,
-        target_position: AxialPosition,
-        allies: list[dict],
-    ) -> int:
-
-        terrain_info = tile.terrain_at(
-            observation,
-            position,
-        )
-
-        terrain_type = terrain_info["terrain"]
-        feature = terrain_info["feature"]
-
-        if terrain_type in (
-            "water",
-            "void",
-        ):
-            return -1000
-
-        score = 0
-
-        # Hills are by far the best archer position.
-        if terrain_type == "hill":
-            score += 20
-
-        if feature == "forest":
-            score += 8
-
-        if feature == "marsh":
-            score -= 10
-
-        # Prefer staying near friendly protection.
-        if allies:
-
-            nearest_ally_distance = min(
-                tile.distance(
-                    position,
-                    ally["position"],
-                )
-                for ally in allies
+        return bool(
+            self._nearby_squadmates(
+                observation,
+                distance=4,
             )
-
-            if nearest_ally_distance <= 2:
-                score += 10
-
-            elif nearest_ally_distance <= 4:
-                score += 5
-
-            else:
-                score -= 15
-
-        # Prefer using the archer's range.
-        target_distance = tile.distance(
-            position,
-            target_position,
         )
 
-        if target_distance >= 4:
-            score += 4
-
-        elif target_distance <= 2:
-            score -= 6
-
-        return score
-
-    # ============================================================
-    # BEST ARCHER COMBAT POSITION
-    # ============================================================
-
-    def _best_protected_archer_position(
+    def _best_archer_attack_position(
         self,
         observation: SkirmishObservation,
         target_position: AxialPosition,
     ) -> int:
+        """
+        Seek high ground while:
+        - remaining in attack range,
+        - remaining near a squadmate,
+        - avoiding marsh when possible.
+        """
 
-        here = me.position(observation)
+        here = me.position(
+            observation
+        )
+
+        allies = self._visible_squadmates(
+            observation
+        )
 
         attack_range = units.STATS[
             "archer"
         ].attack_range
-
-        allies = visible.allies(
-            observation
-        )
 
         best_path = 0
 
@@ -990,53 +943,135 @@ class Agent:
             if len(directions) > 2:
                 continue
 
-            end_position = tile.at_path_end(
+            end = tile.at_path_end(
                 here,
                 path,
             )
 
-            # Must still be able to fire at the target.
+            # Must keep the target in shooting range.
             if tile.distance(
-                end_position,
+                end,
                 target_position,
             ) > attack_range:
                 continue
 
+            # Must remain close enough to at least one squadmate.
+            if allies:
+
+                ally_distance = min(
+                    tile.distance(
+                        end,
+                        ally["position"],
+                    )
+                    for ally in allies
+                )
+
+                if ally_distance > 4:
+                    continue
+
             score = self._archer_position_score(
                 observation,
-                end_position,
+                end,
                 target_position,
                 allies,
             )
 
             if score > best_score:
+
                 best_score = score
                 best_path = path
 
         return best_path
 
-    # ============================================================
-    # ARCHER TERRAIN-AWARE MOVEMENT
-    # ============================================================
+    def _archer_position_score(
+        self,
+        observation: SkirmishObservation,
+        position: AxialPosition,
+        target_position: AxialPosition,
+        allies: list[dict],
+    ) -> int:
+
+        info = tile.terrain_at(
+            observation,
+            position,
+        )
+
+        terrain_type = info["terrain"]
+        feature = info["feature"]
+
+        if terrain_type in (
+            "water",
+            "void",
+        ):
+            return -10000
+
+        score = 0
+
+        # High ground is very valuable to the archer.
+        if terrain_type == "hill":
+            score += 30
+
+        if feature == "forest":
+            score += 8
+
+        if feature == "marsh":
+            score -= 10
+
+        # Stay protected.
+        if allies:
+
+            nearest_ally = min(
+                tile.distance(
+                    position,
+                    ally["position"],
+                )
+                for ally in allies
+            )
+
+            if nearest_ally <= 2:
+                score += 10
+
+            elif nearest_ally <= 4:
+                score += 5
+
+            else:
+                score -= 20
+
+        # Use range rather than standing beside melee enemies.
+        target_distance = tile.distance(
+            position,
+            target_position,
+        )
+
+        if target_distance >= 4:
+            score += 5
+
+        elif target_distance <= 2:
+            score -= 8
+
+        return score
 
     def _path_toward_archer_terrain(
         self,
         observation: SkirmishObservation,
         goal: AxialPosition,
-        footman,
     ) -> int:
 
         here = me.position(
             observation
         )
 
-        best_path = 0
-        best_score = -10000
-
         current_distance = tile.distance(
             here,
             goal,
         )
+
+        mates = self._visible_squadmates(
+            observation
+        )
+
+        best_path = 0
+        best_score = -10000
 
         for path in action.legal_paths(
             observation
@@ -1052,153 +1087,305 @@ class Agent:
             if len(directions) > 2:
                 continue
 
-            end_position = tile.at_path_end(
+            end = tile.at_path_end(
                 here,
                 path,
             )
 
             goal_distance = tile.distance(
-                end_position,
+                end,
                 goal,
             )
 
-            # Do not move backwards just to chase terrain.
-            if goal_distance > current_distance:
-                continue
+            # Positive = progress.
+            # Negative is allowed so the archer can detour around rivers.
+            progress = current_distance - goal_distance
 
-            terrain_info = tile.terrain_at(
+            terrain = tile.terrain_at(
                 observation,
-                end_position,
+                end,
             )
 
-            terrain_type = terrain_info["terrain"]
-            feature = terrain_info["feature"]
-
-            if terrain_type in (
+            if terrain["terrain"] in (
                 "water",
                 "void",
             ):
                 continue
 
-            score = 0
+            score = progress * 12
 
-            # Progress toward objective.
-            score += (
-                current_distance
-                - goal_distance
-            ) * 10
+            # Discourage immediately reversing last activation.
+            if self.avoid_position is not None:
+                if (
+                    end["q"] == self.avoid_position["q"]
+                    and end["r"] == self.avoid_position["r"]
+                ):
+                    score -= 30
 
-            # Strong terrain preference.
-            if terrain_type == "hill":
+            if terrain["terrain"] == "hill":
                 score += 15
 
-            if feature == "forest":
+            if terrain["feature"] == "forest":
                 score += 6
 
-            if feature == "marsh":
+            if terrain["feature"] == "marsh":
                 score -= 8
 
-            # Don't abandon the footman.
-            if footman is not None:
+            if mates:
 
-                distance_to_footman = tile.distance(
-                    end_position,
-                    footman["position"],
+                nearest_mate = min(
+                    tile.distance(
+                        end,
+                        ally["position"],
+                    )
+                    for ally in mates
                 )
 
-                if distance_to_footman <= 3:
-                    score += 5
+                if nearest_mate <= 3:
+                    score += 8
 
-                elif distance_to_footman > 5:
+                elif nearest_mate > 5:
                     score -= 20
 
             if score > best_score:
+
                 best_score = score
                 best_path = path
 
         return best_path
 
     # ============================================================
-    # RALLY POINT
+    # CAVALRY CHARGE
     # ============================================================
 
-    def _rally_point(
+    def _cavalry_attack_path(
         self,
         observation: SkirmishObservation,
-    ) -> AxialPosition:
+        target_position: AxialPosition,
+    ) -> int:
+        """
+        Prefer getting adjacent to the target.
 
-        center = tile.at_center(
+        When two paths are similarly good, prefer one whose final
+        tile is at least 3 hexes from the starting tile, activating
+        Season 3's cavalry Charge ability.
+        """
+
+        here = me.position(
+            observation
+        )
+
+        best_path = 0
+        best_score = -10000
+
+        start_distance = tile.distance(
+            here,
+            target_position,
+        )
+
+        for path in action.legal_paths(
+            observation
+        ):
+
+            if path == 0:
+                continue
+
+            end = tile.at_path_end(
+                here,
+                path,
+            )
+
+            target_distance = tile.distance(
+                end,
+                target_position,
+            )
+
+            displacement = tile.distance(
+                here,
+                end,
+            )
+
+            # Getting close is the main goal.
+            score = -target_distance * 100
+
+            # Strongly reward a legal charge.
+            if displacement >= 3:
+                score += 35
+
+            # Prefer useful terrain if otherwise similar.
+            score += self._terrain_score(
+                observation,
+                end,
+            )
+
+            # Don't choose movement that actually moves farther away
+            # unless no closer choice exists.
+            if target_distance > start_distance:
+                score -= 100
+
+            if score > best_score:
+
+                best_score = score
+                best_path = path
+
+        return best_path
+
+    # ============================================================
+    # TERRAIN
+    # ============================================================
+
+    def _terrain_score(
+        self,
+        observation: SkirmishObservation,
+        position: AxialPosition,
+    ) -> int:
+
+        info = tile.terrain_at(
             observation,
+            position,
         )
 
-        opposite = {
-            1: 4,
-            2: 5,
-            3: 6,
-            4: 1,
-            5: 2,
-            6: 3,
-        }
+        terrain_type = info["terrain"]
+        feature = info["feature"]
 
-        own_direction = opposite[
-            me.direction(observation)
-        ]
+        if terrain_type in (
+            "water",
+            "void",
+        ):
+            return -100
 
-        anchor = center
+        score = 0
 
-        # Four tiles inside our side.
-        for _ in range(4):
+        if terrain_type == "hill":
+            score += 5
 
-            anchor = tile.neighbors(
-                anchor
-            )[own_direction]
+        if feature == "forest":
+            score += 3
 
-        candidates = self._positions_within(
-            anchor,
-            radius=2,
+        if feature == "marsh":
+            score -= 4
+
+        return score
+
+    # ============================================================
+    # GENERAL MOVEMENT
+    # ============================================================
+
+    def _path_toward(
+        self,
+        observation: SkirmishObservation,
+        goal: AxialPosition,
+        max_steps: int | None = None,
+    ) -> int:
+        """
+        Move toward the goal when possible.
+
+        If no legal path gets closer, allow a sideways/detour move.
+        This lets units navigate around rivers instead of freezing
+        whenever the direct route is blocked.
+
+        Recent positions are penalized to reduce back-and-forth
+        movement along obstacles.
+        """
+
+        here = me.position(observation)
+
+        current_distance = tile.distance(
+            here,
+            goal,
         )
 
-        best_position = anchor
-        best_score = -1000
+        improving_paths = []
+        detour_paths = []
 
-        for position in candidates:
+        for path in action.legal_paths(
+            observation
+        ):
+
+            if path == 0:
+                continue
+
+            directions = paths.decode(path)
+
+            if (
+                max_steps is not None
+                and len(directions) > max_steps
+            ):
+                continue
+
+            end = tile.at_path_end(
+                here,
+                path,
+            )
+
+            distance = tile.distance(
+                end,
+                goal,
+            )
 
             terrain_score = self._terrain_score(
                 observation,
-                position,
+                end,
             )
 
-            if terrain_score <= -100:
-                continue
+            # Strongly discourage immediately undoing our
+            # previous movement.
+            backtrack_penalty = 0
+
+            if self.avoid_position is not None:
+                if (
+                    end["q"] == self.avoid_position["q"]
+                    and end["r"] == self.avoid_position["r"]
+                ):
+                    backtrack_penalty = 50
+
+            path_length = len(directions)
 
             score = (
-                terrain_score * 10
-                - tile.distance(
-                    position,
-                    anchor,
-                )
+                -distance * 100
+                + terrain_score * 3
+                - path_length
+                - backtrack_penalty
             )
 
-            if score > best_score:
-                best_score = score
-                best_position = position
+            if distance < current_distance:
+                improving_paths.append(
+                    (score, path)
+                )
+            else:
+                detour_paths.append(
+                    (score, path)
+                )
 
-        return best_position
+        # Normal progress toward goal.
+        if improving_paths:
 
-    def _at_rally_area(
-        self,
-        observation: SkirmishObservation,
-        radius: int = 2,
-    ) -> bool:
+            improving_paths.sort(
+                key=lambda item: item[0],
+                reverse=True,
+            )
 
-        rally = self._rally_point(
-            observation,
-        )
+            return improving_paths[0][1]
 
-        return tile.distance(
-            me.position(observation),
-            rally,
-        ) <= radius
+        # Don't wander unnecessarily when already close.
+        if current_distance <= 2:
+            return 0
+
+        # If nothing gets closer, take the least-bad detour.
+        if detour_paths:
+
+            detour_paths.sort(
+                key=lambda item: item[0],
+                reverse=True,
+            )
+
+            return detour_paths[0][1]
+
+        return 0
+
+    # ============================================================
+    # SMALL UTILITIES
+    # ============================================================
 
     def _positions_within(
         self,
@@ -1218,7 +1405,7 @@ class Agent:
 
         for _ in range(radius):
 
-            new_frontier = []
+            next_frontier = []
 
             for position in frontier:
 
@@ -1238,85 +1425,45 @@ class Agent:
                     results.append(
                         neighbor
                     )
-                    new_frontier.append(
+
+                    next_frontier.append(
                         neighbor
                     )
 
-            frontier = new_frontier
+            frontier = next_frontier
 
         return results
 
-    # ============================================================
-    # GENERAL MOVEMENT
-    # ============================================================
-
-    def _path_toward(
+    def _field_extent(
         self,
         observation: SkirmishObservation,
-        goal: AxialPosition,
-        max_steps: int | None = None,
     ) -> int:
 
-        here = me.position(
-            observation
-        )
-
-        best_path = 0
-
-        best_distance = tile.distance(
-            here,
-            goal,
-        )
-
-        best_terrain = self._terrain_score(
-            observation,
-            here,
-        )
-
-        for path in action.legal_paths(
-            observation
-        ):
-
-            if path == 0:
-                continue
-
-            directions = paths.decode(
-                path
+        try:
+            return int(
+                observation[
+                    "observation"
+                ][
+                    "parameters"
+                ][
+                    "field_extent"
+                ]
             )
+        except (KeyError, TypeError, ValueError):
+            return 12
 
-            if (
-                max_steps is not None
-                and len(directions) > max_steps
-            ):
-                continue
+    def _round_number(
+        self,
+        observation: SkirmishObservation,
+    ) -> int:
 
-            end_position = tile.at_path_end(
-                here,
-                path,
+        try:
+            return int(
+                observation[
+                    "observation"
+                ][
+                    "round"
+                ]
             )
-
-            distance = tile.distance(
-                end_position,
-                goal,
-            )
-
-            terrain_score = self._terrain_score(
-                observation,
-                end_position,
-            )
-
-            if distance < best_distance:
-
-                best_path = path
-                best_distance = distance
-                best_terrain = terrain_score
-
-            elif (
-                distance == best_distance
-                and terrain_score > best_terrain
-            ):
-
-                best_path = path
-                best_terrain = terrain_score
-
-        return best_path
+        except (KeyError, TypeError, ValueError):
+            return 1
