@@ -35,13 +35,13 @@ class Agent:
     - If enemies appear while allies are nearby, everyone attacks.
     - If a unit encounters enemies alone, it regroups.
     - Archers prioritize firing uptime, then tactically reposition for high-ground damage.
-    - Cavalry prefers charge attacks when fighting with its squad.
+    - Cavalry prefers reachable attacks first, then supported charge opportunities; distant archers cannot override hittable nearby enemies.
     - Half-health cavalry regroups, but may rejoin combat once
       friendly support is present.
     - Movement can detour around rivers and other obstacles instead
       of freezing when no legal path directly reduces distance.
     - Units dynamically cooperate with nearby allies and communicate enemy targets/last-known positions.
-    - Reserve footmen prioritize the capture zone while cooperating with nearby allies.
+    - Footmen elect exactly one home defender; a footman already on the home zone wins automatically, while all others reinforce the middle objective.
     """
 
     def reset(self, seed, observation) -> None:
@@ -51,6 +51,10 @@ class Agent:
         # around rivers and other obstacles.
         self.previous_position = None
         self.avoid_position = None
+
+        # Keep several recent hexes, not just the previous one. This is
+        # used to break two-hex movement loops around allied blockers.
+        self.recent_positions = []
 
         # Count consecutive activations where this unit has not changed
         # hexes. This lets cavalry and crowded melee units deliberately
@@ -82,6 +86,77 @@ class Agent:
             if unit_id is not None and player is not None:
                 self.ally_player_by_unit_id[unit_id] = player
 
+        # Season 5: exactly one footman is responsible for holding the
+        # capture zone on our side of the battlefield. At spawn, allied
+        # footmen are close enough to compare starting distances.
+        self.home_defender_id = self._select_home_defender(
+            observation
+        )
+
+        # Distributed home-guard election.
+        #
+        # Each footman announces:
+        #   - whether it STARTED on our home capture zone,
+        #   - its starting distance to that zone.
+        #
+        # "Already on the zone" always wins, then shortest distance,
+        # then unit ID for a deterministic tie-break.
+        self.home_guard_priority = None
+
+        if me.unit_type(observation) == "footman":
+
+            area = self._home_capture_zone(
+                observation
+            )
+
+            if area is not None:
+
+                here = me.position(
+                    observation
+                )
+
+                distance = tile.distance(
+                    here,
+                    area["center"],
+                )
+
+                on_home_zone = (
+                    zone.at(
+                        observation,
+                        here,
+                    ) is not None
+                    and distance <= 2
+                )
+
+                self.home_guard_priority = (
+                    0 if on_home_zone else 1,
+                    distance,
+                    me.unit_id(observation),
+                )
+
+                claim = (
+                    f"G|"
+                    f"{me.unit_id(observation)}|"
+                    f"{1 if on_home_zone else 0}|"
+                    f"{distance}"
+                )
+
+                # Send the claim to every allied footman for which we
+                # have a player mapping. Unit IDs expose unit type.
+                for unit_id, player in (
+                    self.ally_player_by_unit_id.items()
+                ):
+
+                    if "_footman_" not in unit_id:
+                        continue
+
+                    self.pending_messages.append(
+                        {
+                            "to": player,
+                            "text": claim,
+                        }
+                    )
+
     # ============================================================
     # MAIN DECISION
     # ============================================================
@@ -111,6 +186,18 @@ class Agent:
             "q": current_position["q"],
             "r": current_position["r"],
         }
+
+        self.recent_positions.append(
+            (
+                current_position["q"],
+                current_position["r"],
+            )
+        )
+
+        # Four activations is enough to detect common A<->B and
+        # A->B->C->A loops without preventing a legitimate later return.
+        if len(self.recent_positions) > 4:
+            self.recent_positions.pop(0)
 
         self._update_state(observation)
 
@@ -156,9 +243,14 @@ class Agent:
         # --------------------------------------------------------
         # CAVALRY
         #
-        # Healthy cavalry is intentionally aggressive. Its charge
-        # ability rewards long movement, and scouting contact is
-        # valuable even if the cavalry exposes itself.
+        # Season 4 was too aggressive: healthy cavalry committed to
+        # every visible enemy, even when completely alone.
+        #
+        # New rule:
+        # - if an enemy is already in attack range, FIGHT;
+        # - otherwise only commit when at least one nearby ally is
+        #   available to support the attack;
+        # - isolated cavalry regroups instead of solo-charging.
         # --------------------------------------------------------
 
         if unit_type == "cavalry":
@@ -166,22 +258,37 @@ class Agent:
             hp = me.hit_points(observation)
             max_hp = units.STATS["cavalry"].hit_points
 
-            if hp <= max_hp / 2:
+            if enemies:
 
-                # Wounded cavalry only regroups if it is isolated.
-                if enemies and nearby_mates:
+                here = me.position(observation)
+                attack_range = units.STATS[
+                    "cavalry"
+                ].attack_range
+
+                enemy_in_range = any(
+                    tile.distance(
+                        here,
+                        enemy["position"],
+                    ) <= attack_range
+                    for enemy in enemies
+                )
+
+                if enemy_in_range:
                     self.state = State.ENGAGE
+
+                elif nearby_mates:
+                    self.state = State.ENGAGE
+
                 else:
                     self.state = State.REGROUP
 
                 return
 
-            if enemies:
-                self.state = State.ENGAGE
+            if hp <= max_hp / 2:
+                self.state = State.REGROUP
                 return
 
-            # Healthy cavalry should keep advancing rather than
-            # waiting for a local squad to form.
+            # No contact: retain the Season 4 forward pressure.
             if self.state in (
                 State.ASSEMBLE,
                 State.REGROUP,
@@ -201,13 +308,9 @@ class Agent:
                 self.state = State.ENGAGE
 
             elif unit_type == "footman":
-                # Footmen can commit alone if necessary.
                 self.state = State.ENGAGE
 
             else:
-                # Lone archers should avoid close unsupported combat,
-                # but their action logic may still move toward a target
-                # to get into firing range.
                 self.state = State.REGROUP
 
             return
@@ -246,7 +349,6 @@ class Agent:
 
             return
 
-        # ADVANCE stays ADVANCE when there is no contact.
         return
 
     def _act_archer(
@@ -368,26 +470,19 @@ class Agent:
         observation: SkirmishObservation,
     ) -> SkirmishAction:
 
-        enemies = visible.enemies(observation)
-
-        area = self._capture_zone(
-            observation,
-        )
-
-        zone_needs_help = (
-            area is not None
-            and self._capture_needs_reinforcement(
-                observation,
-                desired_allies=3,
+        # Exactly one footman remains responsible for our home point.
+        if (
+            me.unit_id(observation)
+            == self.home_defender_id
+        ):
+            return self._act_home_defender(
+                observation
             )
-        )
+
+        enemies = visible.enemies(observation)
 
         # --------------------------------------------------------
         # ACTIVE COMBAT
-        #
-        # If the zone still needs bodies, footmen only break off for
-        # enemies that are near enough to directly contest the route
-        # or the capture point.
         # --------------------------------------------------------
 
         if enemies:
@@ -396,41 +491,6 @@ class Agent:
                 enemies,
             )
 
-            if zone_needs_help:
-
-                capture_center = area["center"]
-
-                enemy_near_capture = tile.distance(
-                    target["position"],
-                    capture_center,
-                ) <= 4
-
-                enemy_near_self = tile.distance(
-                    me.position(observation),
-                    target["position"],
-                ) <= 2
-
-                if not (
-                    enemy_near_capture
-                    or enemy_near_self
-                ):
-
-                    path = self._path_toward(
-                        observation,
-                        capture_center,
-                        max_steps=2,
-                        allow_close_detour=True,
-                    )
-
-                    if path != 0:
-                        return action.move(
-                            path,
-                            target["unit_id"],
-                            observation,
-                        )
-
-            # Either the zone is sufficiently occupied, or the enemy
-            # is an immediate threat to us/the objective.
             path = self._path_toward(
                 observation,
                 target["position"],
@@ -453,27 +513,21 @@ class Agent:
         # --------------------------------------------------------
         # NO ENEMY
         #
-        # Reinforce capture until at least three visible friendlies
-        # occupy the zone. After that, resume normal aggression.
+        # Season 5 has three capture zones. Every non-defender footman
+        # should contribute to the contested middle objective rather
+        # than following a nearby ally back toward our home defender.
         # --------------------------------------------------------
 
-        if zone_needs_help:
-
-            path = self._path_toward(
-                observation,
-                area["center"],
-                max_steps=2,
-                allow_close_detour=True,
-            )
-
-            if path != 0:
-                return action.move(path)
-
-            return action.stay()
-
-        goal = self._advance_goal(
-            observation,
+        middle = self._middle_capture_zone(
+            observation
         )
+
+        if middle is not None:
+            goal = middle["center"]
+        else:
+            goal = self._advance_goal(
+                observation
+            )
 
         path = self._path_toward(
             observation,
@@ -498,54 +552,102 @@ class Agent:
         max_hp = units.STATS["cavalry"].hit_points
 
         # --------------------------------------------------------
-        # ENEMY VISIBLE
-        #
-        # Healthy cavalry attacks regardless of support. Prefer a
-        # long displacement so Charge triggers whenever practical.
+        # CONTACT
         # --------------------------------------------------------
 
         if enemies:
 
-            target = self._choose_target(
-                enemies,
-            )
+            here = me.position(observation)
+            attack_range = units.STATS[
+                "cavalry"
+            ].attack_range
 
-            path = self._cavalry_attack_path(
-                observation,
-                target["position"],
-            )
+            # CRITICAL FIX:
+            # If cavalry can already attack an enemy, attack NOW.
+            # The old charge planner skipped path 0, so cavalry could
+            # ride past an adjacent enemy while searching for a charge.
+            attackable = [
+                enemy
+                for enemy in enemies
+                if tile.distance(
+                    here,
+                    enemy["position"],
+                ) <= attack_range
+            ]
 
-            if path != 0:
-                return action.move(
-                    path,
+            if attackable:
+
+                target = self._choose_cavalry_target(
+                    observation,
+                    attackable,
+                )
+
+                return action.stay(
                     target["unit_id"],
                     observation,
                 )
 
-            # If the charge planner cannot find anything useful,
-            # still close aggressively instead of waiting.
+            # ----------------------------------------------------
+            # Supported engagement:
+            # charge/close only when the state machine found support.
+            # ----------------------------------------------------
+
+            if self.state == State.ENGAGE:
+
+                target = self._choose_cavalry_target(
+                    observation,
+                    enemies,
+                )
+
+                path = self._cavalry_attack_path(
+                    observation,
+                    target["position"],
+                )
+
+                if path != 0:
+                    return action.move(
+                        path,
+                        target["unit_id"],
+                        observation,
+                    )
+
+                path = self._path_toward(
+                    observation,
+                    target["position"],
+                    allow_close_detour=True,
+                )
+
+                if path != 0:
+                    return action.move(
+                        path,
+                        target["unit_id"],
+                        observation,
+                    )
+
+                return action.stay()
+
+            # ----------------------------------------------------
+            # Isolated contact:
+            # do NOT solo-charge. Regroup with the nearest visible ally.
+            # ----------------------------------------------------
+
+            goal = self._formation_goal(
+                observation,
+            )
+
             path = self._path_toward(
                 observation,
-                target["position"],
+                goal,
                 allow_close_detour=True,
             )
 
             if path != 0:
-                return action.move(
-                    path,
-                    target["unit_id"],
-                    observation,
-                )
+                return action.move(path)
 
-            return action.stay(
-                target["unit_id"],
-                observation,
-            )
+            return action.stay()
 
         # --------------------------------------------------------
         # WOUNDED AND NO CONTACT
-        #
-        # Half-health cavalry may regroup.
         # --------------------------------------------------------
 
         if hp <= max_hp / 2:
@@ -566,11 +668,10 @@ class Agent:
             return action.stay()
 
         # --------------------------------------------------------
-        # HEALTHY SCOUT / CHARGE FORWARD
+        # HEALTHY, NO CONTACT
         #
-        # Use full cavalry movement. Shared enemy intel is preferred,
-        # otherwise advance toward the enemy side. Do NOT slow to
-        # footman/archer speed.
+        # Preserve the Season 4 forward movement. The restraint is only
+        # applied when cavalry actually sees an enemy and lacks support.
         # --------------------------------------------------------
 
         if self._shared_enemy_is_fresh():
@@ -582,8 +683,6 @@ class Agent:
 
         else:
 
-            # Push toward the mirrored friendly rally point on the
-            # enemy half. This maintains broad forward pressure.
             rally = self._squad_rally_point(
                 observation,
             )
@@ -838,24 +937,72 @@ class Agent:
 
     def chat(self, inbox: list[dict]) -> list[dict] | None:
         """
-        Receive delayed squad reports and send reports queued by act().
+        Receive:
+        - G|unit_id|on_home_zone|distance
+          Home-guard election messages.
+        - E|round|unit_id|q|r
+          Delayed enemy reports.
 
-        Messages deliberately stay compact:
-            E|round|unit_id|q|r
-
-        A message cannot affect the order chosen on the same activation;
-        it is stored for the recipient's next activation.
+        Messages affect the NEXT activation.
         """
 
         for message in inbox:
-            text = str(message.get("text", ""))
 
-            if not text.startswith("E|"):
-                continue
+            text = str(
+                message.get("text", "")
+            )
 
             parts = text.split("|")
 
-            if len(parts) != 5:
+            if not parts:
+                continue
+
+            # ----------------------------------------------------
+            # Home guard election
+            # ----------------------------------------------------
+
+            if (
+                parts[0] == "G"
+                and len(parts) == 4
+            ):
+
+                try:
+                    unit_id = parts[1]
+                    on_home = int(parts[2])
+                    distance = int(parts[3])
+                except (TypeError, ValueError):
+                    continue
+
+                priority = (
+                    0 if on_home == 1 else 1,
+                    distance,
+                    unit_id,
+                )
+
+                if (
+                    self.home_guard_priority is None
+                    or priority
+                    < self.home_guard_priority
+                ):
+
+                    self.home_guard_priority = (
+                        priority
+                    )
+
+                    self.home_defender_id = (
+                        unit_id
+                    )
+
+                continue
+
+            # ----------------------------------------------------
+            # Enemy report
+            # ----------------------------------------------------
+
+            if (
+                parts[0] != "E"
+                or len(parts) != 5
+            ):
                 continue
 
             try:
@@ -866,14 +1013,20 @@ class Agent:
             except (TypeError, ValueError):
                 continue
 
-            # Keep only the newest report received.
             if report_round >= self.shared_enemy_round:
-                self.shared_target_id = unit_id
+
+                self.shared_target_id = (
+                    unit_id
+                )
+
                 self.shared_enemy_position = {
                     "q": q,
                     "r": r,
                 }
-                self.shared_enemy_round = report_round
+
+                self.shared_enemy_round = (
+                    report_round
+                )
 
         outgoing = self.pending_messages
         self.pending_messages = []
@@ -966,140 +1119,246 @@ class Agent:
         )
 
     # ============================================================
-    # CAPTURE ZONE
+    # SEASON 5 HOME CAPTURE DEFENSE
     # ============================================================
 
-    def _capture_zone(
+    def _home_capture_zone(
         self,
         observation: SkirmishObservation,
     ):
+        """
+        Return the capture zone on OUR side of the battlefield.
 
-        areas = zone.zones(observation)
+        The three Season 5 zones are spread between the two armies.
+        Determine our side from me.direction(), build a home-side anchor,
+        and select the zone nearest that anchor.
+        """
+
+        areas = list(
+            zone.zones(observation)
+        )
 
         if not areas:
             return None
 
-        # Season 4 has one capture zone.
-        return areas[0]
+        center = tile.at_center(
+            observation
+        )
 
-    def _capture_center(
+        forward = me.direction(
+            observation
+        )
+
+        opposite = {
+            1: 4,
+            2: 5,
+            3: 6,
+            4: 1,
+            5: 2,
+            6: 3,
+        }
+
+        backward = opposite[
+            forward
+        ]
+
+        anchor = {
+            "q": center["q"],
+            "r": center["r"],
+        }
+
+        # Move the anchor deep toward our own side.
+        for _ in range(
+            max(
+                3,
+                self._field_extent(
+                    observation
+                ) - 2,
+            )
+        ):
+            anchor = tile.neighbors(
+                anchor
+            )[backward]
+
+        return min(
+            areas,
+            key=lambda area: tile.distance(
+                area["center"],
+                anchor,
+            ),
+        )
+
+    def _middle_capture_zone(
         self,
         observation: SkirmishObservation,
-    ) -> AxialPosition:
+    ):
+        """
+        Return the capture zone closest to the battlefield center.
 
-        area = self._capture_zone(observation)
+        With Season 5's three spread-out zones, this is the contested
+        middle objective that the mobile footmen should reinforce.
+        """
+
+        areas = list(
+            zone.zones(observation)
+        )
+
+        if not areas:
+            return None
+
+        center = tile.at_center(
+            observation
+        )
+
+        return min(
+            areas,
+            key=lambda area: tile.distance(
+                area["center"],
+                center,
+            ),
+        )
+
+
+    def _select_home_defender(
+        self,
+        observation: SkirmishObservation,
+    ) -> str | None:
+        """
+        Select the footman whose STARTING position is closest to our
+        home capture zone.
+
+        At army spawn the nearby friendly footmen are visible together,
+        allowing each Agent instance to make the same deterministic
+        selection. Unit ID breaks distance ties.
+        """
+
+        area = self._home_capture_zone(
+            observation
+        )
 
         if area is None:
-            return tile.at_center(observation)
+            return None
 
-        return area["center"]
+        candidates = []
 
-    def _is_capture_reserve(
-        self,
-        observation: SkirmishObservation,
-    ) -> bool:
+        if me.unit_type(observation) == "footman":
 
-        return (
-            me.unit_type(observation) == "footman"
-            and self._unit_index(observation) >= 6
+            candidates.append(
+                {
+                    "unit_id": me.unit_id(
+                        observation
+                    ),
+                    "position": me.position(
+                        observation
+                    ),
+                }
+            )
+
+        for ally in visible.allies(
+            observation
+        ):
+
+            if ally["type"] != "footman":
+                continue
+
+            candidates.append(
+                {
+                    "unit_id": ally[
+                        "unit_id"
+                    ],
+                    "position": ally[
+                        "position"
+                    ],
+                }
+            )
+
+        if not candidates:
+            return None
+
+        chosen = min(
+            candidates,
+            key=lambda unit: (
+                tile.distance(
+                    unit["position"],
+                    area["center"],
+                ),
+                unit["unit_id"],
+            ),
         )
 
-    def _capture_needs_reinforcement(
-        self,
-        observation: SkirmishObservation,
-        desired_allies: int = 3,
-    ) -> bool:
-        """
-        Return True until the capture zone visibly contains enough
-        friendly troops.
+        return chosen[
+            "unit_id"
+        ]
 
-        zone.occupants() is visibility-limited, but for this purpose
-        that is acceptable: if this unit cannot confirm that the zone
-        is reinforced, sending another footman is the safer choice.
-        """
-
-        area = self._capture_zone(
-            observation,
-        )
-
-        if area is None:
-            return False
-
-        occupants = zone.occupants(
-            observation,
-            area,
-        )
-
-        own_side = me.side(
-            observation,
-        )
-
-        friendly_count = sum(
-            1
-            for unit in occupants
-            if unit.get("side") == own_side
-        )
-
-        return friendly_count < desired_allies
-
-
-    def _act_capture_footman(
+    def _act_home_defender(
         self,
         observation: SkirmishObservation,
     ) -> SkirmishAction:
         """
-        Reserve footmen occupy the capture point and try to remain
-        adjacent so Season 4's Shield Wall ability can protect them.
+        Move onto our home capture point and HOLD it.
+
+        The defender will attack an enemy already within footman attack
+        range, but it will not chase enemies away from the objective.
         """
 
-        area = self._capture_zone(observation)
-
-        if area is None:
-            goal = tile.at_center(observation)
-        else:
-            goal = area["center"]
-
-        here = me.position(observation)
-        mates = self._visible_squadmates(observation)
-
-        # Once inside the zone, staying adjacent to the reserve partner
-        # is more valuable than endlessly jockeying for the center tile.
-        in_zone = (
-            area is not None
-            and zone.at(observation, here) is not None
+        area = self._home_capture_zone(
+            observation
         )
 
-        if mates:
-            partner = min(
-                mates,
-                key=lambda ally: tile.distance(
-                    here,
-                    ally["position"],
-                ),
-            )
+        if area is None:
+            return action.stay()
 
-            partner_distance = tile.distance(
+        here = me.position(
+            observation
+        )
+
+        enemies = visible.enemies(
+            observation
+        )
+
+        attack_range = units.STATS[
+            "footman"
+        ].attack_range
+
+        attackable = [
+            enemy
+            for enemy in enemies
+            if tile.distance(
                 here,
-                partner["position"],
+                enemy["position"],
+            ) <= attack_range
+        ]
+
+        if attackable:
+
+            target = self._choose_target(
+                attackable
             )
 
-            if in_zone and partner_distance <= 1:
+            return action.stay(
+                target["unit_id"],
+                observation,
+            )
+
+        # Once we are physically inside our zone, stay there.
+        if zone.at(
+            observation,
+            here,
+        ) is not None:
+
+            # zone.at() may refer to one of the other zones, so confirm
+            # we are actually near our designated home zone.
+            if tile.distance(
+                here,
+                area["center"],
+            ) <= 2:
                 return action.stay()
-
-            if partner_distance > 1:
-                path = self._path_toward(
-                    observation,
-                    partner["position"],
-                    max_steps=2,
-                )
-
-                if path != 0:
-                    return action.move(path)
 
         path = self._path_toward(
             observation,
-            goal,
+            area["center"],
             max_steps=2,
+            allow_close_detour=True,
         )
 
         if path != 0:
@@ -1438,25 +1697,159 @@ class Agent:
     # CAVALRY CHARGE
     # ============================================================
 
-    def _cavalry_attack_path(
+    def _choose_cavalry_target(
         self,
         observation: SkirmishObservation,
-        target_position: AxialPosition,
-    ) -> int:
+        enemies: list[dict],
+    ) -> dict:
         """
-        Prefer getting adjacent to the target.
+        Cavalry target priority is based on WHAT CAN BE HIT THIS TURN.
 
-        When two paths are similarly good, prefer one whose final
-        tile is at least 3 hexes from the starting tile, activating
-        Season 3's cavalry Charge ability.
+        Order:
+        1. Enemy already in attack range.
+        2. Enemy cavalry can reach and attack this activation.
+           Fewer movement steps is better.
+        3. Otherwise, nearest visible enemy.
+        4. Only after reachability/distance do HP and unit type matter.
+
+        This intentionally ignores shared_target_id. A communicated archer
+        across the battlefield must never outrank a footman/cavalry that
+        can actually be struck right now.
         """
 
         here = me.position(
             observation
         )
 
+        attack_range = units.STATS[
+            "cavalry"
+        ].attack_range
+
+        legal_paths = [
+            path
+            for path in action.legal_paths(
+                observation
+            )
+            if path != 0
+        ]
+
+        scored = []
+
+        for enemy in enemies:
+
+            current_distance = tile.distance(
+                here,
+                enemy["position"],
+            )
+
+            # Zero steps means cavalry can attack immediately.
+            if current_distance <= attack_range:
+
+                min_attack_steps = 0
+
+            else:
+
+                min_attack_steps = None
+
+                for path in legal_paths:
+
+                    end = tile.at_path_end(
+                        here,
+                        path,
+                    )
+
+                    if tile.distance(
+                        end,
+                        enemy["position"],
+                    ) > attack_range:
+                        continue
+
+                    step_count = len(
+                        paths.decode(path)
+                    )
+
+                    if (
+                        min_attack_steps is None
+                        or step_count
+                        < min_attack_steps
+                    ):
+                        min_attack_steps = (
+                            step_count
+                        )
+
+            reachable_this_turn = (
+                min_attack_steps
+                is not None
+            )
+
+            scored.append(
+                (
+                    # Reachable attack ALWAYS beats unreachable target.
+                    0 if reachable_this_turn else 1,
+
+                    # Among reachable targets, hit the one requiring
+                    # the least movement.
+                    (
+                        min_attack_steps
+                        if reachable_this_turn
+                        else current_distance
+                    ),
+
+                    # Next prefer physical proximity.
+                    current_distance,
+
+                    # Then prefer a weaker target.
+                    enemy["hit_points"],
+
+                    # Archer preference is only a late tie-breaker.
+                    0 if enemy["type"] == "archer" else 1,
+
+                    enemy["unit_id"],
+
+                    enemy,
+                )
+            )
+
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2],
+                item[3],
+                item[4],
+                item[5],
+            )
+        )
+
+        return scored[0][-1]
+
+
+    def _cavalry_attack_path(
+        self,
+        observation: SkirmishObservation,
+        target_position: AxialPosition,
+    ) -> int:
+        """
+        Find a supported attack route.
+
+        Priorities:
+        1. End within cavalry attack range.
+        2. If possible, move 3+ hexes so Charge activates.
+        3. Otherwise make real progress toward the target.
+
+        Staying and attacking is handled BEFORE this helper is called.
+        """
+
+        here = me.position(
+            observation
+        )
+
+        attack_range = units.STATS[
+            "cavalry"
+        ].attack_range
+
         best_path = 0
-        best_score = -10000
+        best_score = -100000
 
         start_distance = tile.distance(
             here,
@@ -1485,21 +1878,34 @@ class Agent:
                 end,
             )
 
-            # Getting close is the main goal.
-            score = -target_distance * 100
+            progress = (
+                start_distance
+                - target_distance
+            )
 
-            # Strongly reward a legal charge.
-            if displacement >= 3:
-                score += 35
+            score = (
+                progress * 40
+                - target_distance * 20
+            )
 
-            # Prefer useful terrain if otherwise similar.
+            # Actually getting into attack range is far more important
+            # than merely moving a long distance.
+            if target_distance <= attack_range:
+                score += 300
+
+                if displacement >= 3:
+                    score += 120
+
+            elif displacement >= 3:
+                # Charge-shaped movement with no attack is only mildly
+                # useful, not a reason to abandon the group.
+                score += 15
+
             score += self._terrain_score(
                 observation,
                 end,
             )
 
-            # Don't choose movement that actually moves farther away
-            # unless no closer choice exists.
             if target_distance > start_distance:
                 score -= 100
 
@@ -1509,10 +1915,6 @@ class Agent:
                 best_path = path
 
         return best_path
-
-    # ============================================================
-    # TERRAIN
-    # ============================================================
 
     def _terrain_score(
         self,
@@ -1559,12 +1961,16 @@ class Agent:
         allow_close_detour: bool = False,
     ) -> int:
         """
-        Move toward the goal when possible.
+        Move toward a goal while avoiding short movement loops.
 
-        If no legal path gets closer, allow a sideways/detour move.
-        allow_close_detour=True is used for melee units near rivers or
-        traffic jams, where being only one or two hexes away does NOT
-        mean the target is actually reachable.
+        The old version separated all "distance improving" paths from
+        detours and ALWAYS chose an improving path first. That meant a
+        recently visited hex one step closer to the goal could beat a
+        necessary sideways route around allied units.
+
+        This version scores all legal endpoints together. Forward
+        progress is still strongly preferred, but recently visited hexes
+        receive enough penalty for a real detour to win.
         """
 
         here = me.position(observation)
@@ -1574,8 +1980,11 @@ class Agent:
             goal,
         )
 
-        improving_paths = []
-        detour_paths = []
+        candidates = []
+
+        recent = set(
+            self.recent_positions
+        )
 
         for path in action.legal_paths(
             observation
@@ -1584,7 +1993,9 @@ class Agent:
             if path == 0:
                 continue
 
-            directions = paths.decode(path)
+            directions = paths.decode(
+                path
+            )
 
             if (
                 max_steps is not None
@@ -1602,66 +2013,78 @@ class Agent:
                 goal,
             )
 
+            progress = (
+                current_distance
+                - distance
+            )
+
             terrain_score = self._terrain_score(
                 observation,
                 end,
             )
 
-            backtrack_penalty = 0
-
-            if self.avoid_position is not None:
-                if (
-                    end["q"] == self.avoid_position["q"]
-                    and end["r"] == self.avoid_position["r"]
-                ):
-                    backtrack_penalty = 50
-
-            path_length = len(directions)
+            path_length = len(
+                directions
+            )
 
             score = (
-                -distance * 100
+                progress * 120
+                - distance * 12
                 + terrain_score * 3
                 - path_length
-                - backtrack_penalty
             )
 
-            if distance < current_distance:
-                improving_paths.append(
-                    (score, path)
-                )
-            else:
-                detour_paths.append(
-                    (score, path)
-                )
-
-        if improving_paths:
-
-            improving_paths.sort(
-                key=lambda item: item[0],
-                reverse=True,
+            end_key = (
+                end["q"],
+                end["r"],
             )
 
-            return improving_paths[0][1]
+            # A recently visited hex is the clearest indication that we
+            # are cycling around a blocker. This penalty is intentionally
+            # larger than the value of one hex of forward progress.
+            if end_key in recent:
+                score -= 220
 
-        # For ordinary formation movement, don't wander around an
-        # occupied nearby goal. For active melee/capture navigation,
-        # however, allow detours around rivers and crowded allies.
-        if (
-            current_distance <= 2
-            and not allow_close_detour
-        ):
+            # The immediately previous hex is especially undesirable.
+            if self.avoid_position is not None:
+                if (
+                    end["q"]
+                    == self.avoid_position["q"]
+                    and end["r"]
+                    == self.avoid_position["r"]
+                ):
+                    score -= 120
+
+            # Ordinary formation movement should not wander once already
+            # next to its destination. Combat/capture navigation may need
+            # a temporary sideways step around occupied hexes.
+            if (
+                current_distance <= 2
+                and progress <= 0
+                and not allow_close_detour
+            ):
+                continue
+
+            candidates.append(
+                (
+                    score,
+                    progress,
+                    path,
+                )
+            )
+
+        if not candidates:
             return 0
 
-        if detour_paths:
+        candidates.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+            ),
+            reverse=True,
+        )
 
-            detour_paths.sort(
-                key=lambda item: item[0],
-                reverse=True,
-            )
-
-            return detour_paths[0][1]
-
-        return 0
+        return candidates[0][2]
 
     def _unstick_path(
         self,
@@ -1718,13 +2141,19 @@ class Agent:
                 end,
             ) * 2
 
-            # Strongly avoid bouncing to the last hex.
+            # Strongly avoid bouncing through recently visited hexes.
+            if (
+                end["q"],
+                end["r"],
+            ) in set(self.recent_positions):
+                score -= 180
+
             if self.avoid_position is not None:
                 if (
                     end["q"] == self.avoid_position["q"]
                     and end["r"] == self.avoid_position["r"]
                 ):
-                    score -= 80
+                    score -= 100
 
             # Prefer a tile with a little breathing room when allied
             # traffic is causing the blockage.
